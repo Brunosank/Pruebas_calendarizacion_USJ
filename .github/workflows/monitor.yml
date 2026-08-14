@@ -2,9 +2,11 @@ name: Monitor USJ Klook
 
 on:
   schedule:
-    # Se ejecuta automáticamente cada 5 minutos
-    - cron: '*/5 * * * *'
-  workflow_dispatch: # Permite probarlo manualmente con un botón
+    # 1. Ráfaga cada 5 minutos entre las 12:00 AM y 12:55 AM hora de Japón (15:00 a 15:55 UTC)
+    - cron: '*/5 15 * * *'
+    # 2. El resto del día, solo una vez por hora (a los 0 minutos de cada hora)
+    - cron: '0 0-14,16-23 * * *'
+  workflow_dispatch:
 
 jobs:
   check-availability:
