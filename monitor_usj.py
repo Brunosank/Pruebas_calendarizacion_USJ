@@ -1,14 +1,13 @@
 import json
 import os
 import sys
-from datetime import datetime
-
-# Requiere 'pip install curl_cffi'
+from datetime import datetime, timezone
 from curl_cffi import requests
 
-# ============== CONFIGURACIÓN ==============
+# ============== CONFIGURACIÓN =================
 
-FECHA_OBJETIVO = "2026-10-13"
+# Fecha objetivo (puedes cambiar el valor por defecto si lo corres localmente)
+FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2026-10-16")
 
 KLOOK_UNITS_URL = "https://www.klook.com/v1/experiencesrv/units/units_service/get_unit_list_by_schedule_id"
 
@@ -17,30 +16,40 @@ TARGETS = [
         "nombre": "Studio Pass",
         "url_compra": "https://www.klook.com/activity/46604-universal-studios-japan-e-ticket-osaka-qr-code-direct-entry/",
         "referer": "https://www.klook.com/activity/46604-universal-studios-japan-e-ticket-osaka-qr-code-direct-entry/",
-        "arrangement_id": "1792108800714034",
+        "sufijo_id": "714034",
         "activo": True,
     },
     {
         "nombre": "Express Pass",
         "url_compra": "https://www.klook.com/activity/3407-universal-studios-japan-express-pass-osaka/",
         "referer": "https://www.klook.com/activity/3407-universal-studios-japan-express-pass-osaka/",
-        "arrangement_id": "1792108800739977",
+        "sufijo_id": "739977",
         "activo": True,
     },
 ]
 
-TELEGRAM_TOKEN = "8874342950:AAE2uAgmqGE3cP7Mc_qOvZ_FPnxd06Y570A"
-TELEGRAM_CHAT_IDS = [
-    "6735724473",
-    "1575450705",
-]
+# Lectura 100% segura mediante Variables de Entorno (Secrets)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "")
+TELEGRAM_CHAT_IDS = [cid.strip() for cid in TELEGRAM_CHAT_IDS_RAW.split(",") if cid.strip()]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
 # =============================================
 
 
+def generar_arrangement_id(fecha_str: str, sufijo: str) -> str:
+    """Calcula el arrangement_id concatenando el Timestamp Unix UTC y el sufijo."""
+    dt = datetime.strptime(fecha_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    ts = int(dt.timestamp())
+    return f"{ts}{sufijo}"
+
+
 def enviar_telegram(mensaje: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_IDS:
+        print("[WARN] Se omitió el envío a Telegram: TELEGRAM_TOKEN o TELEGRAM_CHAT_IDS no están definidos.", file=sys.stderr)
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for chat_id in TELEGRAM_CHAT_IDS:
         try:
@@ -48,7 +57,7 @@ def enviar_telegram(mensaje: str):
             if resp.status_code != 200:
                 print(f"[ERROR] No se pudo enviar a Telegram ({chat_id}): {resp.text}", file=sys.stderr)
         except Exception as e:
-            print(f"[ERROR] Excepción enviando Telegram: {e}", file=sys.stderr)
+            print(f"[ERROR] Excepción enviando Telegram a {chat_id}: {e}", file=sys.stderr)
 
 
 def cargar_estado_anterior() -> dict:
@@ -66,14 +75,16 @@ def guardar_estado(estado: dict):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(estado, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[ERROR] Falló al guardar estado: {e}", file=sys.stderr)
+        print(f"[ERROR] No se pudo guardar estado: {e}", file=sys.stderr)
 
 
-def consultar_disponibilidad(target: dict) -> bool:
+def consultar_disponibilidad(target: dict, fecha_str: str) -> bool:
+    arr_id = generar_arrangement_id(fecha_str, target["sufijo_id"])
+
     params = {
         "k_lang": "en_BS",
         "k_currency": "USD",
-        "arrangement_id": target["arrangement_id"],
+        "arrangement_id": arr_id,
         "translation": "0",
         "preview": "0",
     }
@@ -102,35 +113,36 @@ def consultar_disponibilidad(target: dict) -> bool:
 
     result = data.get("result") or {}
 
+    # 1. Verificar inventarios directos
     inventories = result.get("inventories") or {}
-    if inventories:
-        return sum(inventories.values()) > 0
+    if inventories and sum(inventories.values()) > 0:
+        return True
 
+    # 2. Verificar unidades habilitadas
     units = result.get("units") or result.get("unit_list") or []
-    if units:
-        for unit in units:
-            stock = unit.get("stock", unit.get("inventory", 0))
-            if stock > 0 or unit.get("is_sellable") or unit.get("available"):
-                return True
+    for unit in units:
+        stock = unit.get("stock", unit.get("inventory", 0))
+        if stock > 0 or unit.get("is_sellable") or unit.get("available"):
+            return True
 
     return False
 
 
 def main():
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] Revisando disponibilidad para {FECHA_OBJETIVO}...")
+    print(f"[{timestamp}] Monitoreando disponibilidad para {FECHA_OBJETIVO}...")
 
     disponibilidad_actual = {}
     for target in TARGETS:
         if not target["activo"]:
             continue
         try:
-            disponibilidad_actual[target["nombre"]] = consultar_disponibilidad(target)
+            disponibilidad_actual[target["nombre"]] = consultar_disponibilidad(target, FECHA_OBJETIVO)
         except Exception as e:
             print(f"[WARN] No se pudo consultar {target['nombre']}: {e}", file=sys.stderr)
 
     if not disponibilidad_actual:
-        print("[WARN] No se obtuvo respuesta válida.")
+        print("[WARN] No se obtuvo respuesta de ningún objetivo.")
         return
 
     estado_anterior = cargar_estado_anterior()
@@ -140,12 +152,13 @@ def main():
         disponible_ahora = disponibilidad_actual.get(nombre, False)
         disponible_antes = estado_anterior.get(nombre, False)
 
-        estado_texto = "DISPONIBLE" if disponible_ahora else "NO DISPONIBLE"
+        estado_texto = "¡DISPONIBLE!" if disponible_ahora else "NO DISPONIBLE"
         print(f" -> {nombre}: {estado_texto}")
 
         if disponible_ahora and not disponible_antes:
             mensaje = (
-                f"🎢 ¡Ya está disponible el {nombre} para el {FECHA_OBJETIVO}!\n\n"
+                f"🎢 ¡ALERTA USJ! 🎢\n\n"
+                f"¡Ya hay boletos para {nombre} en la fecha {FECHA_OBJETIVO}!\n\n"
                 f"Compra directa aquí:\n{target['url_compra']}"
             )
             enviar_telegram(mensaje)
