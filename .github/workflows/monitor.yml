@@ -31,7 +31,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
-          FECHA_OBJETIVO: "2026-10-16"
+          FECHA_OBJETIVO: "2026-10-17"
         run: python monitor_usj.py
 
       - name: Guardar estado actualizado en el repositorio
