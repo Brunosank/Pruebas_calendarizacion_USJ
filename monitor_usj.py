@@ -7,7 +7,7 @@ from curl_cffi import requests
 # ============== CONFIGURACIÓN =================
 
 # Fecha objetivo (puedes cambiar el valor por defecto si lo corres localmente)
-FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2026-10-16")
+FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2026-10-17")
 
 KLOOK_UNITS_URL = "https://www.klook.com/v1/experiencesrv/units/units_service/get_unit_list_by_schedule_id"
 
