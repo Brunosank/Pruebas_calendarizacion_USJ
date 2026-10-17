@@ -1,13 +1,15 @@
+import asyncio
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
-from curl_cffi import requests
+
+from curl_cffi.requests import AsyncSession
 
 # ============== CONFIGURACIÓN =================
 
-# Fecha objetivo (puedes cambiar el valor por defecto si lo corres localmente)
-FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2026-10-17")
+FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2027-05-17")
 
 KLOOK_UNITS_URL = "https://www.klook.com/v1/experiencesrv/units/units_service/get_unit_list_by_schedule_id"
 
@@ -28,59 +30,64 @@ TARGETS = [
     },
 ]
 
-# Lectura 100% segura mediante Variables de Entorno (Secrets)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "")
-TELEGRAM_CHAT_IDS = [cid.strip() for cid in TELEGRAM_CHAT_IDS_RAW.split(",") if cid.strip()]
+TELEGRAM_CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+TIMEOUT = 15
+MAX_INTENTOS = 3          # reintentos ante errores transitorios (red, 429, 5xx, bloqueos)
+IMPERSONATE = "chrome124"
+
+# Headers comunes construidos una sola vez
+HEADERS_BASE = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "origin": "https://www.klook.com",
+}
 
 # =============================================
 
 
+def log(msg: str, error: bool = False):
+    print(msg, file=sys.stderr if error else sys.stdout, flush=True)
+
+
 def generar_arrangement_id(fecha_str: str, sufijo: str) -> str:
-    """Calcula el arrangement_id concatenando el Timestamp Unix UTC y el sufijo."""
+    """Timestamp Unix UTC (medianoche) de la fecha + sufijo del producto."""
     dt = datetime.strptime(fecha_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    ts = int(dt.timestamp())
-    return f"{ts}{sufijo}"
+    return f"{int(dt.timestamp())}{sufijo}"
 
 
-def enviar_telegram(mensaje: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_IDS:
-        print("[WARN] Se omitió el envío a Telegram: TELEGRAM_TOKEN o TELEGRAM_CHAT_IDS no están definidos.", file=sys.stderr)
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for chat_id in TELEGRAM_CHAT_IDS:
-        try:
-            resp = requests.post(url, data={"chat_id": chat_id, "text": mensaje})
-            if resp.status_code != 200:
-                print(f"[ERROR] No se pudo enviar a Telegram ({chat_id}): {resp.text}", file=sys.stderr)
-        except Exception as e:
-            print(f"[ERROR] Excepción enviando Telegram a {chat_id}: {e}", file=sys.stderr)
-
-
-def cargar_estado_anterior() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def guardar_estado(estado: dict):
+def _num(valor) -> float:
+    """Convierte a número de forma segura (None, '', strings raros -> 0)."""
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(estado, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[ERROR] No se pudo guardar estado: {e}", file=sys.stderr)
+        return float(valor)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def consultar_disponibilidad(target: dict, fecha_str: str) -> bool:
-    arr_id = generar_arrangement_id(fecha_str, target["sufijo_id"])
+def hay_disponibilidad(data: dict) -> bool:
+    if not data.get("success"):
+        return False
 
+    result = data.get("result") or {}
+
+    # 1. Inventarios directos
+    inventories = result.get("inventories")
+    if isinstance(inventories, dict) and any(_num(v) > 0 for v in inventories.values()):
+        return True
+
+    # 2. Unidades habilitadas
+    units = result.get("units") or result.get("unit_list") or []
+    return any(
+        _num(u.get("stock", u.get("inventory"))) > 0 or u.get("is_sellable") or u.get("available")
+        for u in units
+        if isinstance(u, dict)
+    )
+
+
+async def consultar_disponibilidad(session: AsyncSession, target: dict, arr_id: str) -> bool:
     params = {
         "k_lang": "en_BS",
         "k_currency": "USD",
@@ -88,85 +95,125 @@ def consultar_disponibilidad(target: dict, fecha_str: str) -> bool:
         "translation": "0",
         "preview": "0",
     }
+    headers = {**HEADERS_BASE, "referer": target["referer"]}
 
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
-        "origin": "https://www.klook.com",
-        "referer": target["referer"],
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    }
+    for intento in range(1, MAX_INTENTOS + 1):
+        try:
+            resp = await session.get(KLOOK_UNITS_URL, params=params, headers=headers, timeout=TIMEOUT)
+            resp.raise_for_status()
+            return hay_disponibilidad(resp.json())
+        except Exception as e:
+            if intento == MAX_INTENTOS:
+                raise
+            espera = 2 ** intento
+            log(f"[WARN] {target['nombre']}: intento {intento} falló ({e}); reintentando en {espera}s", error=True)
+            await asyncio.sleep(espera)
+    return False  # inalcanzable
 
-    resp = requests.get(
-        KLOOK_UNITS_URL,
-        params=params,
-        headers=headers,
-        impersonate="chrome124",
-        timeout=15,
-    )
 
-    resp.raise_for_status()
-    data = resp.json()
-
-    if not data.get("success"):
+async def enviar_telegram(session: AsyncSession, mensaje: str) -> bool:
+    """Envía a todos los chats en paralelo. Devuelve True si al menos uno lo recibió."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_IDS:
+        log("[WARN] Telegram omitido: faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_IDS.", error=True)
         return False
 
-    result = data.get("result") or {}
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    # 1. Verificar inventarios directos
-    inventories = result.get("inventories") or {}
-    if inventories and sum(inventories.values()) > 0:
-        return True
-
-    # 2. Verificar unidades habilitadas
-    units = result.get("units") or result.get("unit_list") or []
-    for unit in units:
-        stock = unit.get("stock", unit.get("inventory", 0))
-        if stock > 0 or unit.get("is_sellable") or unit.get("available"):
-            return True
-
-    return False
-
-
-def main():
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] Monitoreando disponibilidad para {FECHA_OBJETIVO}...")
-
-    disponibilidad_actual = {}
-    for target in TARGETS:
-        if not target["activo"]:
-            continue
+    async def _enviar(chat_id: str) -> bool:
         try:
-            disponibilidad_actual[target["nombre"]] = consultar_disponibilidad(target, FECHA_OBJETIVO)
+            r = await session.post(url, json={"chat_id": chat_id, "text": mensaje}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                return True
+            log(f"[ERROR] Telegram ({chat_id}): {r.text}", error=True)
         except Exception as e:
-            print(f"[WARN] No se pudo consultar {target['nombre']}: {e}", file=sys.stderr)
+            log(f"[ERROR] Excepción enviando Telegram a {chat_id}: {e}", error=True)
+        return False
 
-    if not disponibilidad_actual:
-        print("[WARN] No se obtuvo respuesta de ningún objetivo.")
+    resultados = await asyncio.gather(*(_enviar(c) for c in TELEGRAM_CHAT_IDS))
+    return any(resultados)
+
+
+def cargar_estado() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def guardar_estado(estado: dict):
+    """Escritura atómica: nunca deja un state.json corrupto a medias."""
+    try:
+        directorio = os.path.dirname(STATE_FILE)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directorio, delete=False, suffix=".tmp") as tmp:
+            json.dump(estado, tmp, ensure_ascii=False, indent=2)
+        os.replace(tmp.name, STATE_FILE)
+    except Exception as e:
+        log(f"[ERROR] No se pudo guardar estado: {e}", error=True)
+
+
+def mensaje_alerta(target: dict, fecha: str) -> str:
+    return (
+        f"🎢 ¡ALERTA USJ! 🎢\n\n"
+        f"¡Ya hay boletos para {target['nombre']} en la fecha {fecha}!\n\n"
+        f"Compra directa aquí:\n{target['url_compra']}"
+    )
+
+
+async def main():
+    activos = [t for t in TARGETS if t["activo"]]
+    if not activos:
+        log("[WARN] No hay objetivos activos.")
         return
 
-    estado_anterior = cargar_estado_anterior()
+    try:
+        arr_ids = {t["nombre"]: generar_arrangement_id(FECHA_OBJETIVO, t["sufijo_id"]) for t in activos}
+    except ValueError:
+        log(f"[ERROR] FECHA_OBJETIVO inválida: '{FECHA_OBJETIVO}' (formato esperado AAAA-MM-DD)", error=True)
+        sys.exit(1)
 
-    for target in TARGETS:
-        nombre = target["nombre"]
-        disponible_ahora = disponibilidad_actual.get(nombre, False)
-        disponible_antes = estado_anterior.get(nombre, False)
+    ahora = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    log(f"[{ahora}] Monitoreando disponibilidad para {FECHA_OBJETIVO}...")
 
-        estado_texto = "¡DISPONIBLE!" if disponible_ahora else "NO DISPONIBLE"
-        print(f" -> {nombre}: {estado_texto}")
+    # Una sola sesión: reutiliza conexiones TLS y huella de navegador para todas las peticiones
+    async with AsyncSession(impersonate=IMPERSONATE) as session:
+        resultados = await asyncio.gather(
+            *(consultar_disponibilidad(session, t, arr_ids[t["nombre"]]) for t in activos),
+            return_exceptions=True,
+        )
 
-        if disponible_ahora and not disponible_antes:
-            mensaje = (
-                f"🎢 ¡ALERTA USJ! 🎢\n\n"
-                f"¡Ya hay boletos para {nombre} en la fecha {FECHA_OBJETIVO}!\n\n"
-                f"Compra directa aquí:\n{target['url_compra']}"
-            )
-            enviar_telegram(mensaje)
-            print(f"[AVISO ENVIADO] Telegram notificado para {nombre}")
+        # La clave incluye la fecha: si cambias FECHA_OBJETIVO, el estado viejo no bloquea alertas nuevas
+        clave = lambda t: f"{t['nombre']}|{FECHA_OBJETIVO}"
 
-    estado_anterior.update(disponibilidad_actual)
-    guardar_estado(estado_anterior)
+        actual = {}
+        for t, r in zip(activos, resultados):
+            if isinstance(r, Exception):
+                log(f"[WARN] No se pudo consultar {t['nombre']}: {r}", error=True)
+                continue
+            actual[clave(t)] = r
+            log(f" -> {t['nombre']}: {'¡DISPONIBLE!' if r else 'NO DISPONIBLE'}")
+
+        if not actual:
+            log("[WARN] No se obtuvo respuesta de ningún objetivo.")
+            return
+
+        anterior = cargar_estado()
+        nuevos = [t for t in activos if actual.get(clave(t)) and not anterior.get(clave(t))]
+
+        if nuevos:
+            enviados = await asyncio.gather(*(enviar_telegram(session, mensaje_alerta(t, FECHA_OBJETIVO)) for t in nuevos))
+            for t, ok in zip(nuevos, enviados):
+                if ok:
+                    log(f"[AVISO ENVIADO] Telegram notificado para {t['nombre']}")
+                else:
+                    # No se marca como notificado: se reintentará en la próxima ejecución
+                    actual[clave(t)] = False
+
+    nuevo_estado = {**anterior, **actual}
+    if nuevo_estado != anterior:
+        guardar_estado(nuevo_estado)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
